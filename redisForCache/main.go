@@ -5,14 +5,16 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gomodule/redigo/redis"
 )
 
 type DB struct {
-	vals map[string]string
-	lock sync.RWMutex
+	vals  map[string]string
+	lock  sync.RWMutex
+	count int
 }
 
 type OptionalString struct {
@@ -30,6 +32,7 @@ func NoExistString() OptionalString {
 func (db *DB) get(key string) OptionalString {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
+	db.count++
 	if value, ok := db.vals[key]; ok {
 		return OptionalString{
 			value: value,
@@ -46,6 +49,7 @@ func (db *DB) set(key, value string) {
 }
 
 var db *DB
+var readCount int64 = 0
 
 func main() {
 	db = &DB{
@@ -60,6 +64,7 @@ func main() {
 		go worker(ctx, i)
 	}
 	<-ctx.Done()
+	fmt.Printf("readcount: %d, getFromDB count: %d\n", readCount, db.count)
 }
 
 func getFromRedis(c redis.Conn, key string) (OptionalString, error) {
@@ -131,7 +136,7 @@ func getFromDB(c redis.Conn, key string) (OptionalString, error) {
 
 	ostr := db.get(key)
 	if ostr.exist {
-		c.Do("SET", key, ostr.value) // 防雪崩，设置随机的过期时间
+		c.Do("SET", key, ostr.value, "EX", rand.Intn(60)+30) // 防雪崩，设置随机的过期时间
 	} else {
 		c.Do("SET", key, "<nil>") // 防穿透
 	}
@@ -144,12 +149,13 @@ func worker(ctx context.Context, index int) {
 	defer c.Close()
 	keys := []string{"key1", "key2", "key3"}
 	values := []string{"hello", "world"}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Second):
-			if rand.Intn(10) > 5 {
+		case <-time.After(time.Millisecond * 100):
+			if rand.Intn(10) > 0 { // 读一般远多于写
 				key := keys[rand.Intn(3)]
 				ostr, err := getFromRedis(c, key)
 				if err != nil {
@@ -160,6 +166,7 @@ func worker(ctx context.Context, index int) {
 				} else {
 					fmt.Printf("Worker %d knows %s not exist\n", index, key)
 				}
+				atomic.AddInt64(&readCount, 1)
 			} else {
 				key, value := keys[rand.Intn(2)], values[rand.Intn(2)]
 				fmt.Printf("Worker %d set %v = %v\n", index, key, value)
